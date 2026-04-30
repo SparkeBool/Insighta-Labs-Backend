@@ -20,7 +20,17 @@ const authRateLimit = rateLimit({
   legacyHeaders: false
 });
 
-// GET /auth/github - Redirect to GitHub OAuth
+// Clean up expired PKCE entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of pkceStore.entries()) {
+    if (value.expiresAt < now) {
+      pkceStore.delete(key);
+    }
+  }
+}, 5 * 60 * 1000);
+
+// GET /auth/github - Initiate GitHub OAuth
 router.get("/github", authRateLimit, (req, res) => {
   const state = crypto.randomBytes(32).toString("hex");
   const codeVerifier = crypto.randomBytes(32).toString("base64url");
@@ -28,8 +38,14 @@ router.get("/github", authRateLimit, (req, res) => {
 
   const redirectUri = req.query.redirect_uri || process.env.FRONTEND_URL + "/auth/callback";
 
-  // Store PKCE data for callback validation
-  pkceStore.set(state, { codeVerifier, expiresAt: Date.now() + 10 * 60 * 1000 });
+  // Store PKCE data with expiration
+  pkceStore.set(state, {
+    codeVerifier,
+    expiresAt: Date.now() + 10 * 60 * 1000,
+    redirectUri
+  });
+
+  console.log(`[AUTH] Generated state: ${state.substring(0, 8)}... for redirect: ${redirectUri}`);
 
   const params = new URLSearchParams({
     client_id: process.env.GITHUB_CLIENT_ID,
@@ -42,7 +58,6 @@ router.get("/github", authRateLimit, (req, res) => {
 
   const authUrl = `https://github.com/login/oauth/authorize?${params.toString()}`;
 
-  // Return JSON with auth_url for frontend to redirect
   res.json({
     status: "success",
     auth_url: authUrl
@@ -51,74 +66,104 @@ router.get("/github", authRateLimit, (req, res) => {
 
 // GET /auth/github/callback - Handle OAuth callback
 router.get("/github/callback", async (req, res) => {
-  try {
-    const { code, state, code_verifier } = req.query;
-    const redirectUri = req.query.redirect_uri || process.env.FRONTEND_URL + "/auth/callback";
+  console.log("[AUTH] Callback received with query:", req.query);
 
-    // Handle test_code for grading automation
-    if (code === "test_code") {
-      // Create or get test admin user
-      let testUser = await User.findOne({ username: "testadmin" });
-      if (!testUser) {
-        testUser = new User({
-          id: uuidv7(),
-          github_id: "test_github_id",
-          username: "testadmin",
-          email: "admin@test.com",
-          avatar_url: "",
-          role: "admin",
-          is_active: true,
-          last_login_at: new Date(),
-          created_at: new Date()
-        });
-        await testUser.save();
+  const { code, state } = req.query;
+  const redirectUri = req.query.redirect_uri || process.env.FRONTEND_URL + "/auth/callback";
+
+  // Handle test_code for grading automation
+  if (code === "test_code") {
+    console.log("[AUTH] Test code detected, returning test tokens");
+
+    let testUser = await User.findOne({ username: "testadmin" });
+    if (!testUser) {
+      testUser = new User({
+        id: uuidv7(),
+        github_id: "test_github_id",
+        username: "testadmin",
+        email: "admin@test.com",
+        avatar_url: "",
+        role: "admin",
+        is_active: true,
+        last_login_at: new Date(),
+        created_at: new Date()
+      });
+      await testUser.save();
+      console.log("[AUTH] Created test admin user");
+    }
+
+    const accessToken = generateAccessToken(testUser.id);
+    const refreshToken = await generateRefreshToken(testUser.id);
+
+    return res.json({
+      status: "success",
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      user: {
+        id: testUser.id,
+        username: testUser.username,
+        email: testUser.email,
+        role: testUser.role
       }
+    });
+  }
 
-      const accessToken = generateAccessToken(testUser.id);
-      const refreshToken = await generateRefreshToken(testUser.id);
+  // Validate required parameters
+  if (!code || !state) {
+    console.log("[AUTH] Missing code or state");
+    return res.status(400).json({
+      status: "error",
+      message: "Missing code or state"
+    });
+  }
 
-      return res.json({
-        status: "success",
-        access_token: accessToken,
-        refresh_token: refreshToken,
-        user: {
-          id: testUser.id,
-          username: testUser.username,
-          email: testUser.email,
-          role: testUser.role
-        }
-      });
-    }
+  // Get PKCE data from store
+  const pkceData = pkceStore.get(state);
+  console.log(`[AUTH] PKCE data found for state ${state.substring(0, 8)}:`, !!pkceData);
 
-    if (!code || !state) {
-      return res.status(400).json({
-        status: "error",
-        message: "Missing code or state"
-      });
-    }
+  if (!pkceData) {
+    console.log(`[AUTH] PKCE data not found for state: ${state.substring(0, 8)}`);
+    return res.status(400).json({
+      status: "error",
+      message: "Invalid or expired state"
+    });
+  }
 
-    const pkceData = pkceStore.get(state);
-
-    if (!pkceData || pkceData.expiresAt < Date.now()) {
-      return res.status(400).json({
-        status: "error",
-        message: "Invalid or expired state"
-      });
-    }
-
+  if (pkceData.expiresAt < Date.now()) {
+    console.log("[AUTH] PKCE data expired");
     pkceStore.delete(state);
+    return res.status(400).json({
+      status: "error",
+      message: "State expired"
+    });
+  }
 
-    const tokenData = await exchangeCodeForToken(code, pkceData.codeVerifier, redirectUri);
+  // Use the stored redirect URI
+  const storedRedirectUri = pkceData.redirectUri;
+  pkceStore.delete(state);
+
+  try {
+    console.log("[AUTH] Exchanging code for token...");
+
+    // Exchange code for access token
+    const tokenData = await exchangeCodeForToken(code, pkceData.codeVerifier, storedRedirectUri);
 
     if (!tokenData.access_token) {
+      console.log("[AUTH] Failed to get access token from GitHub");
       return res.status(400).json({
         status: "error",
         message: "Failed to exchange code for token"
       });
     }
 
+    console.log("[AUTH] Got access token, fetching GitHub user...");
+
+    // Get GitHub user info
     const githubUser = await getGitHubUser(tokenData.access_token);
 
+    console.log(`[AUTH] GitHub user: ${githubUser.login} (${githubUser.id})`);
+
+    // Find or create user in database
     let user = await User.findOne({ github_id: String(githubUser.id) });
 
     if (!user) {
@@ -135,17 +180,25 @@ router.get("/github/callback", async (req, res) => {
         last_login_at: new Date(),
         created_at: new Date()
       });
+      await user.save();
+      console.log(`[AUTH] Created new user: ${user.username} (role: ${user.role})`);
     } else {
       user.last_login_at = new Date();
+      await user.save();
+      console.log(`[AUTH] Updated existing user: ${user.username} (role: ${user.role})`);
     }
 
-    await user.save();
-
+    // Generate JWT tokens
     const accessToken = generateAccessToken(user.id);
     const refreshToken = await generateRefreshToken(user.id);
-    const isCli = redirectUri.includes("localhost:3101") || redirectUri.includes("localhost:3001");
+
+    console.log("[AUTH] Tokens generated successfully");
+
+    // Check if this is CLI request
+    const isCli = storedRedirectUri.includes("localhost:3001") || storedRedirectUri.includes("localhost:3101");
 
     if (isCli) {
+      console.log("[AUTH] CLI request, returning JSON tokens");
       return res.json({
         status: "success",
         access_token: accessToken,
@@ -158,19 +211,21 @@ router.get("/github/callback", async (req, res) => {
         }
       });
     } else {
-      // Set HTTP-only cookies for web portal
+      // Web portal - set HTTP-only cookies
+      console.log("[AUTH] Web request, setting cookies and redirecting");
+
       res.cookie("access_token", accessToken, {
         httpOnly: true,
-        secure: process.env.NODE_ENV === "production",
-        sameSite: "lax",
+        secure: true,
+        sameSite: "none",
         maxAge: 3 * 60 * 1000,
         path: "/"
       });
 
       res.cookie("refresh_token", refreshToken, {
         httpOnly: true,
-        secure: process.env.NODE_ENV === "production",
-        sameSite: "lax",
+        secure: true,
+        sameSite: "none",
         maxAge: 5 * 60 * 1000,
         path: "/"
       });
@@ -180,7 +235,7 @@ router.get("/github/callback", async (req, res) => {
     }
 
   } catch (error) {
-    console.error("OAuth callback error:", error);
+    console.error("[AUTH] Callback error:", error.message);
     res.status(500).json({
       status: "error",
       message: "Authentication failed"
@@ -216,11 +271,11 @@ router.post("/cli/callback", async (req, res) => {
         last_login_at: new Date(),
         created_at: new Date()
       });
+      await user.save();
     } else {
       user.last_login_at = new Date();
+      await user.save();
     }
-
-    await user.save();
 
     const accessToken = generateAccessToken(user.id);
     const refreshToken = await generateRefreshToken(user.id);
@@ -238,7 +293,7 @@ router.post("/cli/callback", async (req, res) => {
     });
 
   } catch (error) {
-    console.error("CLI callback error:", error);
+    console.error("[AUTH] CLI callback error:", error);
     res.status(500).json({
       status: "error",
       message: "Authentication failed"
@@ -279,7 +334,7 @@ router.post("/refresh", async (req, res) => {
     });
 
   } catch (error) {
-    console.error("Refresh error:", error);
+    console.error("[AUTH] Refresh error:", error);
     res.status(500).json({
       status: "error",
       message: "Failed to refresh token"
@@ -305,7 +360,7 @@ router.post("/logout", async (req, res) => {
     });
 
   } catch (error) {
-    console.error("Logout error:", error);
+    console.error("[AUTH] Logout error:", error);
     res.status(500).json({
       status: "error",
       message: "Logout failed"
